@@ -1,0 +1,44 @@
+import os
+from datetime import datetime, timedelta
+from typing import Optional
+from jose import JWTError, jwt
+# Removed CryptContext
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Configuration
+SECRET_KEY = os.getenv("SECRET_KEY", "1bd2b087ffac4b18e6c9c5365356d48f9eb2dda12938615ab48e3f259faad37d")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 # 1 day
+
+import bcrypt
+
+pwd_context = None # No longer using passlib
+
+def verify_password(plain_password, hashed_password):
+    try:
+        return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+    except Exception:
+        return False
+
+def get_password_hash(password):
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def decode_access_token(token: str):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except JWTError:
+        return None
