@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+sqlmodel
+python-dotenv
+openai
+pydantic-settings
+passlib[bcrypt]
+python-jose[cryptography]
+python-multipart
+websockets
+cryptography
+pymysql
+psycopg2-binary

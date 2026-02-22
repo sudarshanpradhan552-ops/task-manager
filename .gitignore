@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.log
+
+# Environment variables — NEVER commit real secrets
+.env
+.env.local
+.env.*.local
+task-manager/.env
+
+# Node
+node_modules/
+task-manager/node_modules/
+
+# Build output (built at deploy time)
+task-manager/dist/
+
+# OS
+.DS_Store
+Thumbs.db
