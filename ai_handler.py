@@ -1,121 +1,101 @@
 import os
 import json
 import google.generativeai as genai
-from openai import OpenAI
 from dotenv import load_dotenv
-from typing import Optional
 
 load_dotenv()
-
-# Setup OpenAI
-openai_api_key = os.getenv("OPENAI_API_KEY")
-openai_client = OpenAI(api_key=openai_api_key) if openai_api_key else None
 
 # Setup Gemini
 gemini_api_key = os.getenv("GOOGLE_API_KEY")
 if gemini_api_key:
     genai.configure(api_key=gemini_api_key)
     gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+    print("INFO: Gemini AI configured successfully.")
 else:
     gemini_model = None
+    print("WARNING: GOOGLE_API_KEY not set. AI features will use fallback responses.")
+
 
 def parse_task_with_ai(prompt: str):
-    system_prompt = """
-    You are a task management assistant. Extract task details.
-    Return ONLY a JSON object with:
-    - title (string)
-    - description (string or null)
-    - priority (low, medium, high)
-    - due_date (ISO format string or null)
-    - estimated_minutes (integer)
-    - category (Work, Personal, etc.)
-    Today's date: {today}.
-    """
+    """Use Gemini to parse a natural language task into structured data."""
     from datetime import datetime
     today = datetime.now().strftime("%Y-%m-%d")
 
-    try:
-        if gemini_model:
+    system_prompt = f"""
+    You are a task management assistant. Extract task details from the user's prompt.
+    Return ONLY a valid JSON object with these fields:
+    - title (string)
+    - description (string or null)
+    - priority (must be one of: low, medium, high)
+    - due_date (ISO format string like "2024-01-20T10:00:00" or null)
+    - estimated_minutes (integer)
+    - category (string like Work, Personal, Health, etc.)
+    Today's date is: {today}.
+    """
+
+    if gemini_model:
+        try:
             response = gemini_model.generate_content(
-                f"{system_prompt.format(today=today)}\n\nUser Prompt: {prompt}",
+                f"{system_prompt}\n\nUser Prompt: {prompt}",
                 generation_config={"response_mime_type": "application/json"}
             )
             return json.loads(response.text)
-        elif openai_client:
-            response = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "system", "content": system_prompt.format(today=today)}, {"role": "user", "content": prompt}],
-                response_format={ "type": "json_object" }
-            )
-            return json.loads(response.choices[0].message.content)
-    except Exception as e:
-        print(f"AI Error: {e}")
-    
+        except Exception as e:
+            print(f"Gemini parse_task error: {e}")
+
+    # Fallback if Gemini is not configured or fails
     return {
         "title": prompt[:100],
-        "description": "Added via fallback",
+        "description": None,
         "priority": "medium",
         "due_date": None,
-        "estimated_minutes": 15,
+        "estimated_minutes": 30,
         "category": "General"
     }
 
+
 def decompose_task_with_ai(task_title: str, task_description: str = ""):
-    """
-    AI breaks a task into 3-5 logical sub-tasks.
-    """
+    """Use Gemini to break a task into 3-5 sub-tasks."""
     system_prompt = """
-    You are a project management assistant. 
+    You are a project management assistant.
     Break the user's task into exactly 3 to 5 logical sub-tasks.
-    Return ONLY a JSON object with a 'subtasks' field containing a list of strings.
+    Return ONLY a valid JSON object with a 'subtasks' field containing a list of strings.
+    Example: {"subtasks": ["Research the topic", "Create outline", "Write draft"]}
     """
-    
     user_content = f"Task: {task_title}\nDescription: {task_description}"
-    
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content}
-            ],
-            response_format={ "type": "json_object" }
-        )
-        data = json.loads(response.choices[0].message.content)
-        return data.get("subtasks", [])
-    except Exception as e:
-        print(f"AI decomposition error: {e}")
-        return []
+
+    if gemini_model:
+        try:
+            response = gemini_model.generate_content(
+                f"{system_prompt}\n\n{user_content}",
+                generation_config={"response_mime_type": "application/json"}
+            )
+            data = json.loads(response.text)
+            return data.get("subtasks", [])
+        except Exception as e:
+            print(f"Gemini decompose_task error: {e}")
+
+    return []
+
 
 def generate_daily_briefing(tasks_list: list):
+    """Use Gemini to generate a daily productivity briefing."""
     if not tasks_list:
-        return "You have a clear schedule today!"
+        return "You have a clear schedule today! Great time to plan ahead or tackle a new goal. 🚀"
 
     prompt = f"""
-    You are a productivity coach. Provide a 3-sentence summary:
-    1. Total workload.
-    2. Most critical priority.
-    3. Motivational push.
+    You are a productivity coach. Given the following task list, provide a concise 3-sentence briefing:
+    1. Summarize the total workload.
+    2. Highlight the most critical priority.
+    3. End with a motivational push.
     Tasks: {str(tasks_list)}
     """
-    try:
-        if gemini_model:
+
+    if gemini_model:
+        try:
             response = gemini_model.generate_content(prompt)
             return response.text
-        elif openai_client:
-            response = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}]
-            )
-            return response.choices[0].message.content
-    except Exception as e:
-        print(f"Briefing Error: {e}")
-        
-    return f"You have {len(tasks_list)} tasks to look at today. Start with the most important one!"
+        except Exception as e:
+            print(f"Gemini briefing error: {e}")
 
-def suggest_priority(title: str, description: str):
-    """
-    AI suggests priority based on task content.
-    """
-    # Placeholder for prioritization logic
-    pass
+    return f"You have {len(tasks_list)} tasks today. Focus on the most important one first, and take it step by step. You've got this! 💪"
