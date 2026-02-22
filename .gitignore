@@ -17,8 +17,8 @@ task-manager/.env
 node_modules/
 task-manager/node_modules/
 
-# Build output (built at deploy time)
-task-manager/dist/
+# Build output is committed to repo for Render deployment
+# task-manager/dist/
 
 # OS
 .DS_Store

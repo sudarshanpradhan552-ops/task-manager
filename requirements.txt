@@ -11,3 +11,5 @@ websockets
 cryptography
 pymysql
 psycopg2-binary
+google-auth
+google-auth-oauthlib

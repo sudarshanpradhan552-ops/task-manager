@@ -1,18 +1,8 @@
 #!/usr/bin/env bash
-# Render.com Build Script
-# This builds BOTH the backend and frontend into one deployable unit.
-
-set -e  # Exit immediately on error
+# Render.com Build Script - Python only (React dist is pre-built and committed)
+set -e
 
 echo "===> Installing Python dependencies..."
 pip install -r requirements.txt
 
-echo "===> Installing Node.js dependencies for frontend..."
-cd task-manager
-npm install
-
-echo "===> Building React frontend..."
-npm run build
-
-echo "===> Build complete! dist/ folder is ready."
-cd ..
+echo "===> Build complete!"
