@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
     LayoutDashboard,
@@ -59,6 +59,8 @@ const Dashboard: React.FC = () => {
     const [taskDesc, setTaskDesc] = useState('');
     const [taskPriority, setTaskPriority] = useState('medium');
     const [taskCategory, setTaskCategory] = useState('General');
+    const [taskDueDate, setTaskDueDate] = useState('');
+    const [taskDurationDays, setTaskDurationDays] = useState<string>('');
 
     // System Settings States
     const [aiPersonality, setAiPersonality] = useState('Professional');
@@ -69,11 +71,97 @@ const Dashboard: React.FC = () => {
     const [calendarSync, setCalendarSync] = useState(false);
     const [activeNotifications, setActiveNotifications] = useState<{ id: string, message: string }[]>([]);
 
+    // Use a ref so the WebSocket handler always reads the *current* value
+    // without needing to recreate the socket on every toggle
+    const desktopNotificationsRef = useRef(desktopNotifications);
+    useEffect(() => {
+        desktopNotificationsRef.current = desktopNotifications;
+    }, [desktopNotifications]);
+
+    const tasksRef = useRef(tasks);
+    useEffect(() => {
+        tasksRef.current = tasks;
+    }, [tasks]);
+
+    // Helper: fire a toast + optional browser notification
+    const fireNotification = (message: string) => {
+        const id = Math.random().toString(36).substr(2, 9);
+        setActiveNotifications(prev => [...prev, { id, message }]);
+        setTimeout(() => {
+            setActiveNotifications(prev => prev.filter(n => n.id !== id));
+        }, 6000);
+        if (desktopNotificationsRef.current && 'Notification' in window && Notification.permission === 'granted') {
+            new Notification('Task Manager', { body: message, icon: '/favicon.ico' });
+        }
+    };
+
+    // ── Service Worker + Web Push subscription ──────────────────────────────
+    // Registers sw.js, asks for permission, subscribes to push, sends
+    // subscription to backend so it can fire notifications when the tab is closed.
+    useEffect(() => {
+        const registerPush = async () => {
+            if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+                console.warn('Push notifications not supported in this browser.');
+                return;
+            }
+
+            try {
+                // 1. Request notification permission
+                const permission = await Notification.requestPermission();
+                if (permission !== 'granted') {
+                    console.info('Notification permission denied.');
+                    return;
+                }
+
+                // 2. Register the service worker
+                const registration = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+                await navigator.serviceWorker.ready;
+
+                // 3. Fetch VAPID public key from backend
+                const keyRes = await api.get('/push/vapid-public-key');
+                const vapidPublicKey: string = keyRes.data.public_key;
+
+                // Convert base64url VAPID key to Uint8Array
+                const urlBase64ToUint8 = (b64: string): Uint8Array => {
+                    const padding = '='.repeat((4 - b64.length % 4) % 4);
+                    const base64 = (b64 + padding).replace(/-/g, '+').replace(/_/g, '/');
+                    const raw = window.atob(base64);
+                    return Uint8Array.from([...raw].map(c => c.charCodeAt(0)));
+                };
+
+                // 4. Subscribe the browser to Web Push
+                const pushSub = await registration.pushManager.subscribe({
+                    userVisibleOnly: true,
+                    applicationServerKey: urlBase64ToUint8(vapidPublicKey).buffer as ArrayBuffer,
+                });
+
+                // 5. POST subscription to backend for storage
+                const subJson = pushSub.toJSON();
+                await api.post('/push/subscribe', {
+                    endpoint: subJson.endpoint,
+                    p256dh: subJson.keys?.p256dh,
+                    auth: subJson.keys?.auth,
+                });
+
+                console.info('Web Push subscription active — notifications work even when tab is closed.');
+            } catch (err) {
+                console.warn('Push subscription setup failed:', err);
+            }
+        };
+
+        registerPush();
+    }, []);
+
+    // WebSocket — created ONCE on mount, uses ref to avoid stale closures
     useEffect(() => {
         const token = localStorage.getItem('token');
         if (!token) return;
 
-        const socket = new WebSocket(`ws://localhost:8000/ws/${token}`);
+        // Use the current host so it works on any IP (LAN, localhost, etc.)
+        const wsHost = import.meta.env.VITE_API_URL
+            ? import.meta.env.VITE_API_URL.replace(/^https?/, 'ws')
+            : `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`;
+        const socket = new WebSocket(`${wsHost}/ws/${token}`);
 
         socket.onmessage = (event) => {
             const data = JSON.parse(event.data);
@@ -87,25 +175,94 @@ const Dashboard: React.FC = () => {
                 setTasks(prev => prev.filter(t => t.id !== data.task_id));
             }
 
-            // Notifications
+            // Notifications — reads desktopNotificationsRef so always current
             if (data.message) {
-                const id = Math.random().toString(36).substr(2, 9);
-                setActiveNotifications(prev => [...prev, { id, message: data.message }]);
-
-                // Auto-remove after 5 seconds
-                setTimeout(() => {
-                    setActiveNotifications(prev => prev.filter(n => n.id !== id));
-                }, 5000);
-
-                // Browser notification if enabled
-                if (desktopNotifications && "Notification" in window && Notification.permission === "granted") {
-                    new Notification("Task Manager", { body: data.message });
-                }
+                fireNotification(data.message);
             }
         };
 
+        socket.onerror = () => console.warn('WebSocket error — will retry on next mount');
+
         return () => socket.close();
-    }, [desktopNotifications]);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    // ── Two-Tier Reminder System ─────────────────────────────────────────────────
+    //
+    //  SCENARIO 1 — Meeting / Short task
+    //    Fires 5 minutes before due_date for ANY task that has a due time.
+    //    e.g. "You have a meeting at 10 PM" → reminder fires at 9:55 PM.
+    //
+    //  SCENARIO 2 — Multi-day task
+    //    If the task was created more than 2 days before its due_date,
+    //    fire a separate "2 days left" reminder 48 h before due.
+    //    e.g. Task added Feb 1, due Feb 11 (10-day span)
+    //         → reminder fires on Feb 9 (2 days before).
+    //
+    //  Two independent Sets ensure both reminders can fire for the same task.
+    // ────────────────────────────────────────────────────────────────────
+    useEffect(() => {
+        const FIVE_MIN_MS = 5 * 60 * 1000;            // 5 minutes in ms
+        const TWO_DAYS_MS = 2 * 24 * 60 * 60 * 1000;  // 48 hours in ms
+        const OVERDUE_WIN_MS = 2 * 60 * 1000;             // 2-min grace window
+
+        // Independent tracking — each tier fires separately per task
+        const notifiedFiveMin = new Set<number>();
+        const notifiedTwoDay = new Set<number>();
+        const notifiedOverdue = new Set<number>();
+
+        const checkReminders = () => {
+            const now = Date.now();
+
+            tasksRef.current.forEach((task: any) => {
+                if (!task.due_date || task.status === 'completed') return;
+
+                const due = new Date(task.due_date).getTime();
+                const created = task.created_at ? new Date(task.created_at).getTime() : due;
+                const diff = due - now;      // ms remaining (negative = overdue)
+                const span = due - created;  // total task lifespan in ms
+
+                // —— SCENARIO 1: 5-minute meeting/task reminder ——————————————
+                if (diff > 0 && diff <= FIVE_MIN_MS && !notifiedFiveMin.has(task.id)) {
+                    notifiedFiveMin.add(task.id);
+                    const mins = Math.max(1, Math.round(diff / 60000));
+                    fireNotification(
+                        `⏰ Meeting Reminder: "${task.title}" starts in ${mins} minute${mins !== 1 ? 's' : ''}! Get ready.`
+                    );
+                }
+
+                // —— SCENARIO 2: 2-day early warning for multi-day tasks ——————
+                // Only triggers when total task span is more than 2 days
+                if (
+                    span > TWO_DAYS_MS &&         // task was planned for > 2 days
+                    diff > 0 &&                   // not yet overdue
+                    diff <= TWO_DAYS_MS &&         // 2 days or less remaining
+                    !notifiedTwoDay.has(task.id)
+                ) {
+                    notifiedTwoDay.add(task.id);
+                    const hoursLeft = Math.round(diff / (60 * 60 * 1000));
+                    const label = hoursLeft >= 36 ? '2 days' : hoursLeft >= 12 ? `${Math.round(hoursLeft / 24)} day` : `${hoursLeft} hours`;
+                    fireNotification(
+                        `📅 Deadline Approaching: "${task.title}" is due in ~${label}. Time to wrap up!`
+                    );
+                }
+
+                // —— Overdue alert (2-min grace window after due time) ———————
+                if (diff <= 0 && diff > -OVERDUE_WIN_MS && !notifiedOverdue.has(task.id)) {
+                    notifiedOverdue.add(task.id);
+                    fireNotification(
+                        `🚨 Overdue Now: "${task.title}" was due just now! Please take action immediately.`
+                    );
+                }
+            });
+        };
+
+        // Run immediately on mount, then every 60 seconds
+        checkReminders();
+        const interval = setInterval(checkReminders, 60 * 1000);
+        return () => clearInterval(interval);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     const fetchData = async () => {
         try {
@@ -198,18 +355,28 @@ const Dashboard: React.FC = () => {
 
     const handleSubmitTask = async (e: React.FormEvent) => {
         e.preventDefault();
+        // If user picked duration days instead of an exact datetime, compute the due date
+        let finalDueDate = taskDueDate;
+        if (!finalDueDate && taskDurationDays) {
+            const d = new Date();
+            d.setDate(d.getDate() + Number(taskDurationDays));
+            finalDueDate = d.toISOString();
+        }
         try {
             await api.post('/tasks/', {
                 title: taskTitle,
                 description: taskDesc,
                 priority: taskPriority,
-                category: taskCategory
+                category: taskCategory,
+                ...(finalDueDate ? { due_date: finalDueDate } : {})
             });
             setIsTaskModalOpen(false);
             setTaskTitle('');
             setTaskDesc('');
             setTaskPriority('medium');
             setTaskCategory('General');
+            setTaskDueDate('');
+            setTaskDurationDays('');
             fetchData();
         } catch (err) {
             console.error('Failed to add task', err);
@@ -1043,6 +1210,66 @@ const Dashboard: React.FC = () => {
                                                     </button>
                                                 ))}
                                             </div>
+                                        </div>
+                                    </div>
+                                    {/* ── Reminder / Due Date section ── */}
+                                    <div className="space-y-3 p-4 bg-white/3 border border-accent/10 rounded-2xl">
+                                        <p className="text-xs font-bold text-accent uppercase tracking-widest flex items-center gap-1.5">
+                                            <Bell size={11} /> Reminder Settings
+                                        </p>
+
+                                        {/* Scenario 1 — exact date+time (meetings) */}
+                                        <div className="space-y-1">
+                                            <label className="text-xs font-semibold text-slate-custom px-1 flex items-center gap-1">
+                                                <Clock size={11} />
+                                                Meeting / Exact due time
+                                                <span className="text-slate-custom/50 font-normal">(reminds 5 min before)</span>
+                                            </label>
+                                            <input
+                                                type="datetime-local"
+                                                value={taskDueDate}
+                                                onChange={(e) => {
+                                                    setTaskDueDate(e.target.value);
+                                                    if (e.target.value) setTaskDurationDays(''); // mutual exclusion
+                                                }}
+                                                className="w-full bg-steel/20 border border-steel/30 rounded-xl px-4 py-2.5 text-silver text-sm focus:outline-none focus:border-accent transition-all [color-scheme:dark]"
+                                            />
+                                        </div>
+
+                                        <div className="flex items-center gap-3 text-slate-custom/40">
+                                            <div className="flex-1 h-px bg-steel/20" />
+                                            <span className="text-[10px] font-bold uppercase tracking-widest">or</span>
+                                            <div className="flex-1 h-px bg-steel/20" />
+                                        </div>
+
+                                        {/* Scenario 2 — duration in days (multi-day tasks) */}
+                                        <div className="space-y-1">
+                                            <label className="text-xs font-semibold text-slate-custom px-1 flex items-center gap-1">
+                                                <Calendar size={11} />
+                                                Task duration (days from today)
+                                                <span className="text-slate-custom/50 font-normal">(reminds 2 days before)</span>
+                                            </label>
+                                            <div className="flex items-center gap-2">
+                                                <input
+                                                    type="number"
+                                                    min="3"
+                                                    max="365"
+                                                    value={taskDurationDays}
+                                                    onChange={(e) => {
+                                                        setTaskDurationDays(e.target.value);
+                                                        if (e.target.value) setTaskDueDate(''); // mutual exclusion
+                                                    }}
+                                                    placeholder="e.g. 10"
+                                                    className="w-full bg-steel/20 border border-steel/30 rounded-xl px-4 py-2.5 text-silver text-sm focus:outline-none focus:border-accent transition-all"
+                                                />
+                                                <span className="text-sm text-slate-custom whitespace-nowrap">days</span>
+                                            </div>
+                                            {taskDurationDays && Number(taskDurationDays) >= 3 && (
+                                                <p className="text-[11px] text-accent/70 px-1">
+                                                    Due: {new Date(Date.now() + Number(taskDurationDays) * 86400000).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })}
+                                                    &nbsp;· Reminder on {new Date(Date.now() + (Number(taskDurationDays) - 2) * 86400000).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}
+                                                </p>
+                                            )}
                                         </div>
                                     </div>
                                     <div className="flex gap-4 pt-2">

@@ -85,3 +85,18 @@ class TaskUpdate(SQLModel):
 
 class GoogleLoginRequest(SQLModel):
     credential: str
+
+# --- Web Push Subscriptions ---
+class PushSubscription(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    endpoint: str = Field(sa_column_kwargs={"unique": True})
+    p256dh: str       # browser public key
+    auth: str         # browser auth secret
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class PushSubscriptionCreate(SQLModel):
+    endpoint: str
+    p256dh: str
+    auth: str
+

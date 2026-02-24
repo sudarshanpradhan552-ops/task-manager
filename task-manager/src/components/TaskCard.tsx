@@ -1,6 +1,6 @@
 import React from 'react';
 import { motion } from 'framer-motion';
-import { CheckCircle2, Circle, Clock, Tag, Zap, Trash2 } from 'lucide-react';
+import { CheckCircle2, Circle, Clock, Tag, Zap, Trash2, Bell } from 'lucide-react';
 
 interface SubTask {
     id: number;
@@ -16,6 +16,7 @@ interface Task {
     status: string;
     category?: string;
     due_date?: string;
+    created_at?: string;
     estimated_minutes?: number;
     subtasks: SubTask[];
 }
@@ -27,12 +28,56 @@ interface TaskCardProps {
     onDelete: (id: number) => void;
 }
 
+// Returns urgency info based on due_date
+function getDueInfo(due_date?: string, status?: string): {
+    label: string;
+    colorClass: string;
+    pulse: boolean;
+} | null {
+    if (!due_date || status === 'completed') return null;
+
+    const now = Date.now();
+    const due = new Date(due_date).getTime();
+    const diff = due - now;   // ms remaining
+    const five_min = 5 * 60 * 1000;
+    const two_days = 2 * 24 * 60 * 60 * 1000;
+
+    const fmt = (d: Date) =>
+        d.toLocaleString('en-IN', {
+            day: '2-digit', month: 'short',
+            hour: '2-digit', minute: '2-digit', hour12: true,
+        });
+
+    if (diff < 0) {
+        return { label: `Overdue · ${fmt(new Date(due))}`, colorClass: 'text-red-400', pulse: true };
+    }
+    if (diff <= five_min) {
+        const mins = Math.max(1, Math.round(diff / 60000));
+        return { label: `Due in ${mins} min · ${fmt(new Date(due))}`, colorClass: 'text-orange-400', pulse: true };
+    }
+    if (diff <= two_days) {
+        const hrs = Math.round(diff / (60 * 60 * 1000));
+        const label = hrs < 24
+            ? `Due in ${hrs}h · ${fmt(new Date(due))}`
+            : `Due in ${Math.ceil(hrs / 24)}d · ${fmt(new Date(due))}`;
+        return { label, colorClass: 'text-yellow-400', pulse: false };
+    }
+    // More than 2 days away — show date quietly
+    return {
+        label: `Due ${new Date(due_date).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })}`,
+        colorClass: 'text-emerald-400/70',
+        pulse: false,
+    };
+}
+
 const TaskCard: React.FC<TaskCardProps> = ({ task, onToggleStatus, onDecompose, onDelete }) => {
     const priorityColors: Record<string, string> = {
         high: 'text-red-400 bg-red-400/10 border-red-400/20',
         medium: 'text-amber-400 bg-amber-400/10 border-amber-400/20',
         low: 'text-emerald-400 bg-emerald-400/10 border-emerald-400/20',
     };
+
+    const dueInfo = getDueInfo(task.due_date, task.status);
 
     return (
         <motion.div
@@ -58,7 +103,7 @@ const TaskCard: React.FC<TaskCardProps> = ({ task, onToggleStatus, onDecompose, 
                         <h3 className={`font-semibold truncate ${task.status === 'completed' ? 'line-through text-slate-custom' : 'text-silver'}`}>
                             {task.title}
                         </h3>
-                        <span className={`text-[10px] uppercase tracking-wider font-bold px-2 py-0.5 rounded-full border ${priorityColors[task.priority] || priorityColors.medium}`}>
+                        <span className={`shrink-0 text-[10px] uppercase tracking-wider font-bold px-2 py-0.5 rounded-full border ${priorityColors[task.priority] || priorityColors.medium}`}>
                             {task.priority}
                         </span>
                     </div>
@@ -67,6 +112,18 @@ const TaskCard: React.FC<TaskCardProps> = ({ task, onToggleStatus, onDecompose, 
                         <p className="text-sm text-slate-custom line-clamp-2 mb-3">
                             {task.description}
                         </p>
+                    )}
+
+                    {/* Due date + urgency row */}
+                    {dueInfo && (
+                        <div className={`flex items-center gap-1.5 text-xs font-medium mb-2 ${dueInfo.colorClass}`}>
+                            {dueInfo.pulse ? (
+                                <Bell className={`w-3 h-3 ${dueInfo.pulse ? 'animate-bounce' : ''}`} />
+                            ) : (
+                                <Clock className="w-3 h-3" />
+                            )}
+                            <span>{dueInfo.label}</span>
+                        </div>
                     )}
 
                     <div className="flex flex-wrap items-center gap-4 text-xs text-slate-custom">

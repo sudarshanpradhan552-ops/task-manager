@@ -1,4 +1,8 @@
 import os
+import json
+import asyncio
+import logging
+from datetime import datetime, timezone
 from fastapi import FastAPI, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -6,30 +10,168 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from sqlmodel import Session, select
 from typing import List, Dict
-from database import create_db_and_tables, get_session
-from models import Task, TaskCreate, TaskRead, TaskUpdate, User, UserCreate, UserRead, SubTask, UserUpdate, GoogleLoginRequest
+from database import create_db_and_tables, get_session, engine
+from models import Task, TaskCreate, TaskRead, TaskUpdate, User, UserCreate, UserRead, SubTask, UserUpdate, GoogleLoginRequest, PushSubscription, PushSubscriptionCreate
 from ai_handler import parse_task_with_ai, generate_daily_briefing, decompose_task_with_ai
 from auth import get_password_hash, verify_password, create_access_token, decode_access_token
 from google.oauth2 import id_token
-from google.auth.transport import requests
-
+from google.auth.transport import requests as google_requests
 from fastapi.middleware.cors import CORSMiddleware
-
 from contextlib import asynccontextmanager
+
+# Web Push
+try:
+    from pywebpush import webpush, WebPushException
+    PUSH_ENABLED = True
+except ImportError:
+    PUSH_ENABLED = False
+    logging.warning("pywebpush not installed — push notifications disabled")
+
+# Load VAPID config
+from dotenv import load_dotenv
+load_dotenv()
+
+VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY", "")
+VAPID_PUBLIC_KEY  = os.getenv("VAPID_PUBLIC_KEY",  "")
+VAPID_EMAIL       = os.getenv("VAPID_EMAIL", "mailto:admin@taskmanager.app")
+
+# ─── Helper: send a single Web Push message ───────────────────────────────────
+def send_push(sub: PushSubscription, payload: dict) -> bool:
+    """Send a push message to one browser subscription. Returns True on success."""
+    if not PUSH_ENABLED or not VAPID_PRIVATE_KEY:
+        return False
+    try:
+        subscription_info = {
+            "endpoint": sub.endpoint,
+            "keys": {"p256dh": sub.p256dh, "auth": sub.auth}
+        }
+        webpush(
+            subscription_info=subscription_info,
+            data=json.dumps(payload),
+            vapid_private_key=VAPID_PRIVATE_KEY,
+            vapid_claims={"sub": VAPID_EMAIL, "aud": sub.endpoint.split("/")[:3][-1]}
+        )
+        return True
+    except WebPushException as e:
+        logging.warning(f"Push failed for sub {sub.id}: {e}")
+        # 410 Gone = subscription expired/revoked — remove it
+        if "410" in str(e) or "404" in str(e):
+            try:
+                with Session(engine) as session:
+                    stale = session.get(PushSubscription, sub.id)
+                    if stale:
+                        session.delete(stale)
+                        session.commit()
+            except Exception:
+                pass
+        return False
+    except Exception as e:
+        logging.warning(f"Push error: {e}")
+        return False
+
+# ─── Background Reminder Scheduler ───────────────────────────────────────────
+#
+#  Runs every 60 s on the SERVER (no browser needed).
+#  Scenario 1: Fires 5 min before any task's due_date.
+#  Scenario 2: Fires 2 days before for tasks with span > 2 days.
+#
+# Each reminder type tracked with a separate in-memory Set so both can fire.
+_notified_5min:   set = set()   # task ids already sent 5-min push
+_notified_2day:   set = set()   # task ids already sent 2-day push
+_notified_overdue: set = set()  # task ids already sent overdue push
+
+FIVE_MIN_S    = 5 * 60          # 5 minutes in seconds
+TWO_DAYS_S    = 2 * 24 * 3600  # 48 hours in seconds
+OVERDUE_WIN_S = 2 * 60         # 2-minute grace window
+
+def _check_and_send_reminders():
+    """Called every 60 s. Queries DB, sends push to subscribed users."""
+    now = datetime.now(timezone.utc)
+    try:
+        with Session(engine) as session:
+            tasks = session.exec(
+                select(Task).where(Task.status != "completed", Task.due_date != None)
+            ).all()
+
+            for task in tasks:
+                due = task.due_date.replace(tzinfo=timezone.utc) if task.due_date.tzinfo is None else task.due_date
+                created = task.created_at.replace(tzinfo=timezone.utc) if task.created_at.tzinfo is None else task.created_at
+                diff_s = (due - now).total_seconds()
+                span_s = (due - created).total_seconds()
+
+                subs = session.exec(
+                    select(PushSubscription).where(PushSubscription.user_id == task.owner_id)
+                ).all()
+                if not subs:
+                    continue
+
+                def push_all(msg: str, title: str = "⏰ Task Reminder"):
+                    payload = {"title": title, "body": msg, "task_id": task.id}
+                    for s in subs:
+                        send_push(s, payload)
+
+                # — Scenario 1: 5-minute reminder for meetings / short tasks —
+                key1 = f"5m_{task.id}"
+                if 0 < diff_s <= FIVE_MIN_S and key1 not in _notified_5min:
+                    _notified_5min.add(key1)
+                    mins = max(1, round(diff_s / 60))
+                    push_all(
+                        f'"​{task.title}​" starts in {mins} min​—​get ready!',
+                        title="⏰ Meeting Starting Soon"
+                    )
+
+                # — Scenario 2: 2-day early warning for multi-day tasks —
+                key2 = f"2d_{task.id}"
+                if span_s > TWO_DAYS_S and 0 < diff_s <= TWO_DAYS_S and key2 not in _notified_2day:
+                    _notified_2day.add(key2)
+                    hours = round(diff_s / 3600)
+                    label = "2 days" if hours >= 36 else f"{round(hours/24)} day" if hours >= 12 else f"{hours} hours"
+                    push_all(
+                        f'"​{task.title}​" is due in ~{label}. Time to wrap up!',
+                        title="📅 Deadline Approaching"
+                    )
+
+                # — Overdue alert —
+                key3 = f"ov_{task.id}"
+                if -OVERDUE_WIN_S <= diff_s <= 0 and key3 not in _notified_overdue:
+                    _notified_overdue.add(key3)
+                    push_all(
+                        f'"​{task.title}​" was due just now! Please take action.',
+                        title="🚨 Task Overdue"
+                    )
+    except Exception as e:
+        logging.error(f"Reminder scheduler error: {e}")
+
+
+async def _reminder_loop():
+    """Async wrapper that runs _check_and_send_reminders in a thread every 60s."""
+    import concurrent.futures
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    loop = asyncio.get_event_loop()
+    while True:
+        await loop.run_in_executor(executor, _check_and_send_reminders)
+        await asyncio.sleep(60)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
+    # Startup — create tables then launch background reminder task
     create_db_and_tables()
+    asyncio.create_task(_reminder_loop())
     yield
-    # Shutdown (empty for now)
+    # Shutdown (empty)
 
 app = FastAPI(title="AI Task Manager API", lifespan=lifespan)
 
-# Configure CORS - More permissive for development
+# Configure CORS — allow LAN IP frontend + localhost
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Allow all for development to clear CORS hurdles
+    allow_origins=[
+        "http://10.172.225.37:5173",   # LAN frontend (Vite dev server)
+        "http://localhost:5173",        # local dev fallback
+        "http://127.0.0.1:5173",
+        "http://10.172.225.37:8000",   # backend itself (for service workers)
+        "http://localhost:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -178,7 +320,7 @@ def google_auth(request: GoogleLoginRequest, session: Session = Depends(get_sess
              # If not set, we can't verify, but for dev we might want a fallback or just error
              raise HTTPException(status_code=500, detail="Google Client ID not configured")
              
-        idinfo = id_token.verify_oauth2_token(request.credential, requests.Request(), client_id)
+        idinfo = id_token.verify_oauth2_token(request.credential, google_requests.Request(), client_id)
 
         # ID token is valid. Get the user's Google Account ID from the decoded token.
         email = idinfo['email']
@@ -361,6 +503,58 @@ async def delete_task(task_id: int, current_user: User = Depends(get_current_use
         "task_id": task_id,
         "message": "Task deleted."
     }, current_user.id)
+    return {"ok": True}
+
+# ─── Web Push Subscription Endpoints ────────────────────────────────────────
+
+@app.get("/push/vapid-public-key")
+def get_vapid_public_key():
+    """Frontend calls this to get the VAPID public key for push subscription."""
+    return {"public_key": VAPID_PUBLIC_KEY}
+
+@app.post("/push/subscribe")
+def subscribe_push(
+    sub_data: PushSubscriptionCreate,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    """Save (or update) a browser's push subscription for the current user."""
+    # Check if this endpoint is already stored
+    existing = session.exec(
+        select(PushSubscription).where(PushSubscription.endpoint == sub_data.endpoint)
+    ).first()
+    if existing:
+        # Refresh keys in case they changed
+        existing.p256dh = sub_data.p256dh
+        existing.auth   = sub_data.auth
+        existing.user_id = current_user.id
+        session.add(existing)
+    else:
+        new_sub = PushSubscription(
+            user_id  = current_user.id,
+            endpoint = sub_data.endpoint,
+            p256dh   = sub_data.p256dh,
+            auth     = sub_data.auth,
+        )
+        session.add(new_sub)
+    session.commit()
+    return {"ok": True}
+
+@app.delete("/push/unsubscribe")
+def unsubscribe_push(
+    endpoint: str,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    sub = session.exec(
+        select(PushSubscription).where(
+            PushSubscription.endpoint == endpoint,
+            PushSubscription.user_id  == current_user.id
+        )
+    ).first()
+    if sub:
+        session.delete(sub)
+        session.commit()
     return {"ok": True}
 
 # --- Serve React Frontend (must be LAST, after all API routes) ---
