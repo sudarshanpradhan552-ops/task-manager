@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import logging
+logging.basicConfig(level=logging.INFO)
 from datetime import datetime, timezone
 from fastapi import FastAPI, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.encoders import jsonable_encoder
@@ -317,23 +318,40 @@ def google_auth(request: GoogleLoginRequest, session: Session = Depends(get_sess
         # Get Client ID from environment
         client_id = os.getenv("GOOGLE_CLIENT_ID")
         if not client_id:
-             # If not set, we can't verify, but for dev we might want a fallback or just error
-             raise HTTPException(status_code=500, detail="Google Client ID not configured")
-             
-        idinfo = id_token.verify_oauth2_token(request.credential, google_requests.Request(), client_id)
+            raise HTTPException(status_code=500, detail="Google Client ID not configured on server")
+        
+        logging.info(f"Google auth attempt — Client ID: {client_id[:20]}...")
+        
+        # Verify the Google ID token
+        # clock_skew_in_seconds allows up to 10s of clock difference between client and server
+        idinfo = id_token.verify_oauth2_token(
+            request.credential,
+            google_requests.Request(),
+            client_id,
+            clock_skew_in_seconds=10
+        )
 
         # ID token is valid. Get the user's Google Account ID from the decoded token.
         email = idinfo['email']
         name = idinfo.get('name', email.split('@')[0])
         picture = idinfo.get('picture')
+        
+        logging.info(f"Google auth success for email: {email}")
 
         # Check if user exists
         user = session.exec(select(User).where(User.email == email)).first()
         
         if not user:
-            # Create new user
+            # Create new user — handle case where name is already taken as username
+            base_username = name
+            username_candidate = base_username
+            counter = 1
+            while session.exec(select(User).where(User.username == username_candidate)).first():
+                username_candidate = f"{base_username}{counter}"
+                counter += 1
+            
             user = User(
-                username=name,
+                username=username_candidate,
                 email=email,
                 profile_pic=picture,
                 hashed_password=get_password_hash(os.urandom(24).hex()) # Dummy password
@@ -344,11 +362,14 @@ def google_auth(request: GoogleLoginRequest, session: Session = Depends(get_sess
         
         access_token = create_access_token(data={"sub": user.username})
         return {"access_token": access_token, "token_type": "bearer"}
-    except ValueError:
-        # Invalid token
-        raise HTTPException(status_code=400, detail="Invalid Google token")
+    except ValueError as e:
+        # This is thrown when the token is invalid — log the actual reason
+        logging.error(f"Google token verification FAILED: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid Google token: {str(e)}")
     except Exception as e:
+        logging.error(f"Google auth unexpected error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 # --- WebSocket Endpoint ---
 @app.websocket("/ws/{token}")

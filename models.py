@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List
 from sqlmodel import Field, SQLModel, Relationship
 
@@ -47,7 +47,7 @@ class TaskBase(SQLModel):
     category: Optional[str] = Field(default="General", index=True)
     due_date: Optional[datetime] = None
     estimated_minutes: Optional[int] = Field(default=None)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     reminder_sent: bool = Field(default=False)
     owner_id: Optional[int] = Field(default=None, foreign_key="user.id")
 

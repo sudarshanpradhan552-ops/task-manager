@@ -14,35 +14,35 @@ export default defineConfig({
     proxy: {
       // Proxy API requests to the FastAPI backend
       '/api': {
-        target: 'http://10.172.225.37:8000',
+        target: 'http://localhost:8000',
         changeOrigin: true,
       },
       '/token': {
-        target: 'http://10.172.225.37:8000',
+        target: 'http://localhost:8000',
         changeOrigin: true,
       },
       '/signup': {
-        target: 'http://10.172.225.37:8000',
+        target: 'http://localhost:8000',
         changeOrigin: true,
       },
       '/tasks': {
-        target: 'http://10.172.225.37:8000',
+        target: 'http://localhost:8000',
         changeOrigin: true,
       },
       '/users': {
-        target: 'http://10.172.225.37:8000',
+        target: 'http://localhost:8000',
         changeOrigin: true,
       },
       '/auth': {
-        target: 'http://10.172.225.37:8000',
+        target: 'http://localhost:8000',
         changeOrigin: true,
       },
       '/push': {
-        target: 'http://10.172.225.37:8000',
+        target: 'http://localhost:8000',
         changeOrigin: true,
       },
       '/ws': {
-        target: 'ws://10.172.225.37:8000',
+        target: 'ws://localhost:8000',
         ws: true,            // WebSocket proxying
         changeOrigin: true,
       },

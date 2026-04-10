@@ -91,7 +91,7 @@ const Dashboard: React.FC = () => {
             setActiveNotifications(prev => prev.filter(n => n.id !== id));
         }, 6000);
         if (desktopNotificationsRef.current && 'Notification' in window && Notification.permission === 'granted') {
-            new Notification('Task Manager', { body: message, icon: '/favicon.ico' });
+            new Notification('Task Manager', { body: message, icon: '/vite.svg' });
         }
     };
 

@@ -26,8 +26,8 @@ self.addEventListener('push', (event) => {
     const title = data.title || '⏰ Task Reminder';
     const options = {
         body: data.body || 'You have an upcoming task!',
-        icon: '/favicon.ico',
-        badge: '/favicon.ico',
+        icon: '/vite.svg',
+        badge: '/vite.svg',
         tag: `task-${data.task_id || Date.now()}`,   // replaces older notification for same task
         renotify: true,
         requireInteraction: true,   // stays until user dismisses it
