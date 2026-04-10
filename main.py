@@ -167,6 +167,8 @@ app = FastAPI(title="AI Task Manager API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "https://task-manager-final-mc4u.onrender.com",  # Production (Render)
+        "https://ai-task-manager.onrender.com",           # Alt production URL
         "http://10.172.225.37:5173",   # LAN frontend (Vite dev server)
         "http://localhost:5173",        # local dev fallback
         "http://127.0.0.1:5173",
@@ -180,8 +182,14 @@ app.add_middleware(
 )
 
 @app.get("/api/health")
+@app.head("/api/health")
 def root():
     return {"message": "AI Task Manager API is running"}
+
+@app.head("/")
+def head_root():
+    """Render health checker uses HEAD / — return 200 to confirm service is up."""
+    return {}
 
 # OAuth2 setup
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
